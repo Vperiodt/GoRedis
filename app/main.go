@@ -39,6 +39,10 @@ func main() {
 	flag.StringVar(&serverConfig.DbFileName, "dbfilename", "dump.rdb", "The name of the RDB file")
 	flag.Parse()
 
+	err := loadRdbFile()
+	if err != nil {
+		fmt.Println("Error loading RDB file:", err)
+	}
 	fmt.Println("Logs from your program will appear here!")
 
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
@@ -193,7 +197,24 @@ func handleConnection(conn net.Conn) {
 			response := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
 				len(paramName), paramName, len(paramValue), paramValue)
 			conn.Write([]byte(response))
+		case "KEYS":
+			if len(args) < 2 || args[1] != "*" {
+				conn.Write([]byte("-ERR unsupported KEYS pattern\r\n"))
+				continue
+			}
 
+			dataStore.RLock()
+			keys := make([]string, 0, len(dataStore.data))
+			for k := range dataStore.data {
+				keys = append(keys, k)
+			}
+			dataStore.RUnlock()
+
+			response := fmt.Sprintf("*%d\r\n", len(keys))
+			for _, k := range keys {
+				response += fmt.Sprintf("$%d\r\n%s\r\n", len(k), k)
+			}
+			conn.Write([]byte(response))
 		default:
 			conn.Write([]byte(fmt.Sprintf("-ERR unknown command '%s'\r\n", command)))
 
