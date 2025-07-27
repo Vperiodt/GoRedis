@@ -16,11 +16,13 @@ import (
 var _ = net.Listen
 var _ = os.Exit
 
+// configuration values for your server
 var serverConfig struct {
 	Dir        string
 	DbFileName string
 }
 
+// value associated with a key in data
 type valueEntry struct {
 	value   string
 	expires time.Time
@@ -41,7 +43,9 @@ func main() {
 
 	err := loadRdbFile()
 	if err != nil {
-		fmt.Println("Error loading RDB file:", err)
+		if !os.IsNotExist(err) {
+			fmt.Println("Error loading RDB file:", err)
+		}
 	}
 	fmt.Println("Logs from your program will appear here!")
 
@@ -157,26 +161,26 @@ func handleConnection(conn net.Conn) {
 			}
 			key := args[1]
 
-			var response []byte
-
-			dataStore.Lock()
+			dataStore.RLock()
 
 			entry, ok := dataStore.data[key]
 
 			if !ok {
-				response = []byte("$-1\r\n")
-
+				conn.Write([]byte("$-1\r\n"))
 			} else if !entry.expires.IsZero() && time.Now().After(entry.expires) {
-				delete(dataStore.data, key)
-				response = []byte("$-1\r\n")
 
+				dataStore.RUnlock() // Release read lock
+				dataStore.Lock()    // Get write lock to delete
+				delete(dataStore.data, key)
+				dataStore.Unlock() // Release write lock
+				conn.Write([]byte("$-1\r\n"))
+				continue
 			} else {
-				response = []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(entry.value), entry.value))
+				response := fmt.Sprintf("$%d\r\n%s\r\n", len(entry.value), entry.value)
+				conn.Write([]byte(response))
 			}
 
-			dataStore.Unlock()
-
-			conn.Write(response)
+			dataStore.RUnlock()
 		case "CONFIG":
 			if len(args) < 3 || strings.ToUpper(args[1]) != "GET" {
 				conn.Write([]byte("-ERR Syntax error for CONFIG command\r\n"))
@@ -215,6 +219,32 @@ func handleConnection(conn net.Conn) {
 				response += fmt.Sprintf("$%d\r\n%s\r\n", len(k), k)
 			}
 			conn.Write([]byte(response))
+		case "INCR":
+			if len(args) < 2 {
+				conn.Write([]byte("-ERR wrong number of arguments for 'incr' command\r\n"))
+				continue
+			}
+			key := args[1]
+			dataStore.Lock()
+			defer dataStore.Unlock()
+
+			entry, ok := dataStore.data[key]
+			if !ok {
+				newValue := 1
+				dataStore.data[key] = valueEntry{value: strconv.Itoa(newValue)}
+				conn.Write([]byte(fmt.Sprintf(":%d\r\n", newValue)))
+			} else {
+				currentValue, err := strconv.Atoi(entry.value)
+				if err != nil {
+					conn.Write([]byte("-ERR value is not an integer or out of range\r\n"))
+				} else {
+					newValue := currentValue + 1
+					entry.value = strconv.Itoa(newValue)
+					dataStore.data[key] = entry
+					conn.Write([]byte(fmt.Sprintf(":%d\r\n", newValue)))
+				}
+			}
+
 		default:
 			conn.Write([]byte(fmt.Sprintf("-ERR unknown command '%s'\r\n", command)))
 

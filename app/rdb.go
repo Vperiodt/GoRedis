@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 type rdbParser struct {
@@ -42,12 +43,42 @@ func loadRdbFile() error {
 	}
 
 	for {
+		var expiry time.Time
 		opCode, err := parser.reader.ReadByte()
 		if err != nil {
 			if err == io.EOF {
 				break // End of file is expected
 			}
 			return err
+		}
+
+		if opCode == 0xFD { // Expiry in seconds (4 bytes)
+			buf := make([]byte, 4)
+			if _, err := io.ReadFull(parser.reader, buf); err != nil {
+				return fmt.Errorf("reading expiry (FD): %w", err)
+			}
+
+			expirySecs := binary.LittleEndian.Uint32(buf)
+			expiry = time.Unix(int64(expirySecs), 0)
+
+			// After reading expiry, we MUST read the next byte, which is the value type opcode.
+			opCode, err = parser.reader.ReadByte()
+			if err != nil {
+				return err
+			}
+		} else if opCode == 0xFC { // Expiry in milliseconds (8 bytes)
+			buf := make([]byte, 8)
+			if _, err := io.ReadFull(parser.reader, buf); err != nil {
+				return fmt.Errorf("reading expiry (FC): %w", err)
+			}
+
+			expiryMillis := binary.LittleEndian.Uint64(buf)
+			expiry = time.UnixMilli(int64(expiryMillis))
+
+			opCode, err = parser.reader.ReadByte()
+			if err != nil {
+				return err
+			}
 		}
 		switch opCode {
 		case 0xFA:
@@ -69,16 +100,6 @@ func loadRdbFile() error {
 			if _, _, err := parser.readLength(); err != nil {
 				return err
 			}
-		case 0xFD, 0xFC:
-			expiryBytes := 4
-			if opCode == 0xFC {
-				expiryBytes = 8
-			}
-			if _, err := parser.reader.Discard(expiryBytes); err != nil {
-				return err
-			}
-
-			fallthrough
 		case 0x00:
 			key, err := parser.readString()
 			if err != nil {
@@ -89,7 +110,7 @@ func loadRdbFile() error {
 				return err
 			}
 			dataStore.Lock()
-			dataStore.data[string(key)] = valueEntry{value: string(value)}
+			dataStore.data[string(key)] = valueEntry{value: string(value), expires: expiry}
 			dataStore.Unlock()
 		case 0xFF:
 			return nil
