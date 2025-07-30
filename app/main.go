@@ -24,8 +24,15 @@ var serverConfig struct {
 
 // value associated with a key in data
 type valueEntry struct {
-	value   string
+	value   any
 	expires time.Time
+}
+type StreamEntry struct {
+	ID     string
+	Fields map[string]string
+}
+type RedisStream struct {
+	Entries []StreamEntry
 }
 
 var dataStore = struct {
@@ -138,7 +145,7 @@ func executeCommand(command string, args []string) []byte {
 			return []byte("$-1\r\n")
 		}
 
-		response := fmt.Sprintf("$%d\r\n%s\r\n", len(entry.value), entry.value)
+		response := fmt.Sprintf("$%d\r\n%s\r\n", len(entry.value.(string)), entry.value)
 		dataStore.RUnlock() // Release the read lock
 		return []byte(response)
 
@@ -155,7 +162,7 @@ func executeCommand(command string, args []string) []byte {
 			dataStore.data[key] = valueEntry{value: strconv.Itoa(newValue)}
 			return []byte(fmt.Sprintf(":%d\r\n", newValue))
 		} else {
-			currentValue, err := strconv.Atoi(entry.value)
+			currentValue, err := strconv.Atoi(entry.value.(string))
 			if err != nil {
 				return []byte("-ERR value is not an integer or out of range\r\n")
 			} else {
@@ -165,6 +172,70 @@ func executeCommand(command string, args []string) []byte {
 				return []byte(fmt.Sprintf(":%d\r\n", newValue))
 			}
 		}
+	case "TYPE":
+		if len(args) < 1 {
+			return []byte("-ERR wrong number of arguments for 'type' command\r\n")
+		}
+
+		key := args[0]
+
+		dataStore.RLock()
+		defer dataStore.RUnlock()
+
+		entry, ok := dataStore.data[key]
+		if !ok {
+			return []byte("+none\r\n")
+		}
+		if !entry.expires.IsZero() && time.Now().After(entry.expires) {
+			return []byte("+none\r\n")
+		}
+		switch entry.value.(type) {
+		case string:
+			return []byte("+string\r\n")
+		case *RedisStream:
+			return []byte("+stream\r\n")
+		default:
+			return []byte("+none\r\n")
+		}
+	case "XADD":
+
+		if len(args) < 3 {
+			return []byte("-ERR wrong number of arguments for 'xadd' command\r\n")
+		}
+		key := args[0]
+		id := args[1]
+
+		if (len(args)-2)%2 != 0 {
+			return []byte("-ERR wrong number of arguments for 'xadd' command\r\n")
+		}
+
+		dataStore.Lock()
+		defer dataStore.Unlock()
+
+		streamEntry := StreamEntry{
+			ID:     id,
+			Fields: make(map[string]string),
+		}
+		for i := 2; i < len(args); i += 2 {
+			streamEntry.Fields[args[i]] = args[i+1]
+		}
+		// check if the key already exists
+		existingEntry, ok := dataStore.data[key]
+		if ok {
+			stream, isStream := existingEntry.value.(*RedisStream)
+			if !isStream {
+				return []byte("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+			}
+			stream.Entries = append(stream.Entries, streamEntry)
+		} else {
+			// If it doesn't exist, create a new stream
+			dataStore.data[key] = valueEntry{
+				value: &RedisStream{
+					Entries: []StreamEntry{streamEntry},
+				},
+			}
+		}
+		return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(id), id))
 	default:
 		return []byte(fmt.Sprintf("-ERR unknown command '%s'\r\n", command))
 	}
