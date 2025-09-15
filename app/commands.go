@@ -1,56 +1,70 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"math"
+	"net"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
 )
 
-func executeCommand(command string, args []string) []byte {
+var emptyRdbBytes []byte
+
+func init() {
+	const emptyRdbBase64 = "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP9o9kZmcGwg"
+	var err error
+	emptyRdbBytes, err = base64.StdEncoding.DecodeString(emptyRdbBase64)
+	if err != nil {
+		panic("Failed to decode empty RDB file")
+	}
+}
+func executeCommand(conn net.Conn, command string, args []string) []byte {
 	switch command {
 	case "PING":
 		return []byte("+PONG\r\n")
 	case "ECHO":
-		return handleEcho(args)
+		return handleEcho(conn, args)
 	case "SET":
-		return handleSet(args)
+		return handleSet(conn, args)
 	case "GET":
-		return handleGet(args)
+		return handleGet(conn, args)
 	case "INCR":
-		return handleIncr(args)
+		return handleIncr(conn, args)
 	case "TYPE":
-		return handleType(args)
+		return handleType(conn, args)
 	case "XADD":
-		return handleXadd(args)
+		return handleXadd(conn, args)
 	case "XRANGE":
-		return handleXrange(args)
+		return handleXrange(conn, args)
 	case "LRANGE":
-		return handleLrange(args)
+		return handleLrange(conn, args)
 	case "LPUSH":
-		return handleLpush(args)
+		return handleLpush(conn, args)
 	case "LLEN":
-		return handleLlen(args)
+		return handleLlen(conn, args)
 	case "LPOP":
-		return handleLpop(args)
+		return handleLpop(conn, args)
 	case "BLPOP":
-		return handleBlpop(args)
+		return handleBlpop(conn, args)
 	case "XREAD":
-		return handleXread(args)
+		return handleXread(conn, args)
 	case "CONFIG":
-		return handleConfig(args)
+		return handleConfig(conn, args)
 	case "KEYS":
-		return handleKeys(args)
+		return handleKeys(conn, args)
 	case "RPUSH":
-		return handleRpush(args)
+		return handleRpush(conn, args)
 	case "INFO":
-		return handleInfo(args)
+		return handleInfo(conn, args)
 	case "REPLCONF":
-		return handleReplconf(args)
+		return handleReplconf(conn, args)
 	case "PSYNC":
-		return handlePsync(args)
+		return handlePsync(conn, args)
+	case "WAIT":
+		return handleWait(conn, args)
 	default:
 		return []byte(fmt.Sprintf("-ERR unknown command '%s'\r\n", command))
 	}
@@ -92,7 +106,7 @@ func parseRangeID(idStr string, defaultSeq int64) (ms int64, seq int64, err erro
 	return ms, seq, nil
 }
 
-func handleXrange(args []string) []byte {
+func handleXrange(_ net.Conn, args []string) []byte {
 	if len(args) != 3 {
 		return []byte("-ERR wrong number of arguments for 'xrange' command\r\n")
 	}
@@ -161,7 +175,7 @@ func handleXrange(args []string) []byte {
 	return []byte(builder.String())
 }
 
-func handleEcho(args []string) []byte {
+func handleEcho(_ net.Conn, args []string) []byte {
 	if len(args) < 1 {
 		return []byte("-ERR wrong number of arguments for 'echo' command\r\n")
 	}
@@ -169,7 +183,7 @@ func handleEcho(args []string) []byte {
 	return []byte(response)
 }
 
-func handleSet(args []string) []byte {
+func handleSet(_ net.Conn, args []string) []byte {
 	if len(args) < 2 {
 		return []byte("-ERR wrong number of arguments for 'set' command\r\n")
 	}
@@ -188,7 +202,7 @@ func handleSet(args []string) []byte {
 	return []byte("+OK\r\n")
 }
 
-func handleGet(args []string) []byte {
+func handleGet(_ net.Conn, args []string) []byte {
 	if len(args) < 1 {
 		return []byte("-ERR wrong number of arguments for 'get' command\r\n")
 	}
@@ -216,7 +230,7 @@ func handleGet(args []string) []byte {
 	return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(val), val))
 }
 
-func handleIncr(args []string) []byte {
+func handleIncr(_ net.Conn, args []string) []byte {
 	if len(args) < 1 {
 		return []byte("-ERR wrong number of arguments for 'incr' command\r\n")
 	}
@@ -241,7 +255,7 @@ func handleIncr(args []string) []byte {
 	return []byte(fmt.Sprintf(":%d\r\n", newValue))
 }
 
-func handleType(args []string) []byte {
+func handleType(_ net.Conn, args []string) []byte {
 	if len(args) < 1 {
 		return []byte("-ERR wrong number of arguments for 'type' command\r\n")
 	}
@@ -266,7 +280,7 @@ func handleType(args []string) []byte {
 	}
 }
 
-func handleXadd(args []string) []byte {
+func handleXadd(_ net.Conn, args []string) []byte {
 	if len(args) < 3 || (len(args)-2)%2 != 0 {
 		return []byte("-ERR wrong number of arguments for 'xadd' command\r\n")
 	}
@@ -357,7 +371,7 @@ func handleXadd(args []string) []byte {
 	return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(newID), newID))
 }
 
-func handleConfig(args []string) []byte {
+func handleConfig(_ net.Conn, args []string) []byte {
 	if len(args) < 2 || strings.ToUpper(args[0]) != "GET" {
 		return []byte("-ERR Syntax error for CONFIG command\r\n")
 	}
@@ -375,7 +389,7 @@ func handleConfig(args []string) []byte {
 	return []byte(fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(paramName), paramName, len(paramValue), paramValue))
 }
 
-func handleKeys(args []string) []byte {
+func handleKeys(_ net.Conn, args []string) []byte {
 	if len(args) < 1 || args[0] != "*" {
 		return []byte("-ERR unsupported KEYS pattern\r\n")
 	}
@@ -392,7 +406,7 @@ func handleKeys(args []string) []byte {
 	return []byte(response)
 }
 
-func handleXread(args []string) []byte {
+func handleXread(_ net.Conn, args []string) []byte {
 	var blockTimeoutMs int64 = -1
 	streamsArgIndex := 0
 
@@ -540,7 +554,7 @@ func performNonBlockingRead(keys []string, ids []string) []byte {
 	return []byte(responseBuilder.String())
 }
 
-func handleRpush(args []string) []byte {
+func handleRpush(_ net.Conn, args []string) []byte {
 	if len(args) < 2 {
 		return []byte("-ERR wrong number of arguments for 'rpush' command\r\n")
 	}
@@ -572,7 +586,7 @@ func handleRpush(args []string) []byte {
 
 	return []byte(fmt.Sprintf(":%d\r\n", len(list)))
 }
-func handleLrange(args []string) []byte {
+func handleLrange(_ net.Conn, args []string) []byte {
 	if len(args) != 3 {
 		return []byte("-ERR wrong number of arguments for 'lrange' command\r\n")
 	}
@@ -633,7 +647,7 @@ func handleLrange(args []string) []byte {
 
 	return []byte(builder.String())
 }
-func handleLpush(args []string) []byte {
+func handleLpush(_ net.Conn, args []string) []byte {
 	if len(args) < 2 {
 		return []byte("-ERR wrong number of arguments for 'lpush' command\r\n")
 	}
@@ -667,7 +681,7 @@ func handleLpush(args []string) []byte {
 
 	return []byte(fmt.Sprintf(":%d\r\n", len(list)))
 }
-func handleLlen(args []string) []byte {
+func handleLlen(_ net.Conn, args []string) []byte {
 	if len(args) != 1 {
 		return []byte("-ERR wrong number of arguments for 'llen' command\r\n")
 	}
@@ -689,7 +703,7 @@ func handleLlen(args []string) []byte {
 	return []byte(fmt.Sprintf(":%d\r\n", len(list)))
 }
 
-func handleLpop(args []string) []byte {
+func handleLpop(_ net.Conn, args []string) []byte {
 	if len(args) < 1 || len(args) > 2 {
 		return []byte("-ERR wrong number of arguments for 'lpop' command\r\n")
 	}
@@ -738,7 +752,7 @@ func handleLpop(args []string) []byte {
 	}
 	return []byte(builder.String())
 }
-func handleBlpop(args []string) []byte {
+func handleBlpop(_ net.Conn, args []string) []byte {
 	if len(args) < 2 {
 		return []byte("-ERR wrong number of arguments for 'blpop' command\r\n")
 	}
@@ -781,7 +795,7 @@ func handleBlpop(args []string) []byte {
 	}
 }
 
-func handleInfo(args []string) []byte {
+func handleInfo(_ net.Conn, args []string) []byte {
 	if len(args) < 1 {
 		return []byte("-ERR wrong number of arguments for 'info' command\r\n")
 	}
@@ -806,16 +820,39 @@ func handleInfo(args []string) []byte {
 
 }
 
-func handleReplconf(args []string) []byte {
+func handleReplconf(_ net.Conn, args []string) []byte {
 	return []byte("+OK\r\n")
 }
 
-func handlePsync(args []string) []byte {
-
+func handlePsync(conn net.Conn, args []string) []byte {
 	if len(args) != 2 {
 		return []byte("-ERR wrong number of arguments for 'psync' command\r\n")
 	}
-	response := fmt.Sprintf("+FULLRESYNC %s %d\r\n", serverConfig.MasterReplID, serverConfig.MasterReplOffset)
 
-	return []byte(response)
+	fullResyncResponse := fmt.Sprintf("+FULLRESYNC %s %d\r\n", serverConfig.MasterReplID, serverConfig.MasterReplOffset)
+	conn.Write([]byte(fullResyncResponse))
+
+	rdbHeader := fmt.Sprintf("$%d\r\n", len(emptyRdbBytes))
+	conn.Write([]byte(rdbHeader))
+	conn.Write(emptyRdbBytes)
+
+	replicationState.AddReplica(conn)
+
+	return nil
+}
+
+func handleWait(_ net.Conn, args []string) []byte {
+	if len(args) != 2 {
+		return []byte("-ERR wrong number of arguments for 'wait' command\r\n")
+	}
+	_, err := strconv.Atoi(args[0])
+	if err != nil {
+		return []byte("-ERR value is not an integer or out of range\r\n")
+	}
+	_, err = strconv.Atoi(args[1])
+	if err != nil {
+		return []byte("-ERR value is not an integer or out of range\r\n")
+	}
+	numReplicas := replicationState.GetReplicaCount()
+	return []byte(fmt.Sprintf(":%d\r\n", numReplicas))
 }

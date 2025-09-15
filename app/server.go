@@ -110,12 +110,10 @@ func (s *Server) Start() error {
 		go s.handleConnection(conn)
 	}
 }
-
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
-	// Transaction state is specific to each connection
 	inTransaction := false
 	var commandQueue []QueuedCommand
 
@@ -135,7 +133,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 			fmt.Println("Invalid number of arguments:", err.Error())
 			return
 		}
-
 		var args []string
 		for i := 0; i < numArgs; i++ {
 			line, err := reader.ReadString('\n')
@@ -159,7 +156,6 @@ func (s *Server) handleConnection(conn net.Conn) {
 			}
 			args = append(args, string(data[:length]))
 		}
-
 		if len(args) == 0 {
 			continue
 		}
@@ -167,30 +163,27 @@ func (s *Server) handleConnection(conn net.Conn) {
 		command := strings.ToUpper(args[0])
 		cmdArgs := args[1:]
 
-		if inTransaction && command != "EXEC" && command != "DISCARD" {
-			commandQueue = append(commandQueue, QueuedCommand{Command: command, Args: cmdArgs})
-			conn.Write([]byte("+QUEUED\r\n"))
-			continue
-		}
-
 		switch command {
 		case "MULTI":
 			if inTransaction {
 				conn.Write([]byte("-ERR MULTI calls can not be nested\r\n"))
 			} else {
 				inTransaction = true
-				commandQueue = nil
+				commandQueue = nil // Reset queue
 				conn.Write([]byte("+OK\r\n"))
 			}
 		case "EXEC":
 			if !inTransaction {
 				conn.Write([]byte("-ERR EXEC without MULTI\r\n"))
 			} else {
-				response := fmt.Sprintf("*%d\r\n", len(commandQueue))
-				conn.Write([]byte(response))
+				conn.Write([]byte(fmt.Sprintf("*%d\r\n", len(commandQueue))))
 				for _, cmd := range commandQueue {
-					cmdResponse := executeCommand(cmd.Command, cmd.Args)
+					cmdResponse := executeCommand(conn, cmd.Command, cmd.Args)
 					conn.Write(cmdResponse)
+					if serverConfig.Role == "master" {
+						fullCmdArgs := append([]string{cmd.Command}, cmd.Args...)
+						replicationState.Propagate(fullCmdArgs)
+					}
 				}
 				inTransaction = false
 				commandQueue = nil
@@ -204,8 +197,23 @@ func (s *Server) handleConnection(conn net.Conn) {
 				conn.Write([]byte("+OK\r\n"))
 			}
 		default:
-			response := executeCommand(command, cmdArgs)
-			conn.Write(response)
+			if inTransaction {
+				commandQueue = append(commandQueue, QueuedCommand{Command: command, Args: cmdArgs})
+				conn.Write([]byte("+QUEUED\r\n"))
+			} else {
+				response := executeCommand(conn, command, cmdArgs)
+
+				if serverConfig.Role == "master" {
+					switch command {
+					case "SET", "RPUSH", "LPUSH", "LPOP", "INCR", "XADD":
+						replicationState.Propagate(args)
+					}
+				}
+
+				if response != nil {
+					conn.Write(response)
+				}
+			}
 		}
 	}
 }
@@ -273,57 +281,130 @@ func initiateHandshake(masterHost, masterPort string) {
 		fmt.Println("Failed to connect to master:", err)
 		os.Exit(1)
 	}
+	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
-
-	pingCmd := "*1\r\n$4\r\nPING\r\n"
-	_, err = conn.Write([]byte(pingCmd))
-	if err != nil {
-		fmt.Println("Failed to send PING to master:", err)
-		return
-	}
-	response, err := reader.ReadString('\n')
-	if err != nil || strings.TrimSpace(response) != "+PONG" {
-		fmt.Println("Invalid response to PING from master:", response)
-		return
-	}
-	fmt.Println("Received PONG from master")
-
+	conn.Write([]byte("*1\r\n$4\r\nPING\r\n"))
+	reader.ReadString('\n')
 	replconfPortCmd := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$%d\r\n%s\r\n", len(serverConfig.Port), serverConfig.Port)
-	_, err = conn.Write([]byte(replconfPortCmd))
-	if err != nil {
-		fmt.Println("Failed to send REPLCONF port to master:", err)
-		return
-	}
-	response, err = reader.ReadString('\n')
-	if err != nil || strings.TrimSpace(response) != "+OK" {
-		fmt.Println("Invalid response to REPLCONF port from master:", response)
-		return
-	}
-	fmt.Println("Received OK for REPLCONF listening-port")
+	conn.Write([]byte(replconfPortCmd))
+	reader.ReadString('\n')
+	conn.Write([]byte("*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"))
+	reader.ReadString('\n')
+	conn.Write([]byte("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"))
+	reader.ReadString('\n')
 
-	replconfCapaCmd := "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
-	_, err = conn.Write([]byte(replconfCapaCmd))
+	line, err := reader.ReadString('\n')
 	if err != nil {
-		fmt.Println("Failed to send REPLCONF capa to master:", err)
+		fmt.Println("Error reading RDB file length:", err)
 		return
 	}
-	response, err = reader.ReadString('\n')
-	if err != nil || strings.TrimSpace(response) != "+OK" {
-		fmt.Println("Invalid response to REPLCONF capa from master:", response)
-		return
+	if line[0] == '$' {
+		length, _ := strconv.Atoi(strings.TrimSpace(line[1:]))
+		buf := make([]byte, length)
+		io.ReadFull(reader, buf)
 	}
-	fmt.Println("Received OK for REPLCONF capa")
-	psyncCmd := "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
-	_, err = conn.Write([]byte(psyncCmd))
-	if err != nil {
-		fmt.Println("Failed to send PSYNC to master:", err)
-		return
+
+	fmt.Println("Handshake and RDB sync completed. Listening for commands.")
+
+	var replicaOffset int = 0
+	for {
+		var totalCommandBytes int = 0
+
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				fmt.Println("Error reading command from master:", err.Error())
+			}
+			return
+		}
+		totalCommandBytes += len(line)
+
+		if line[0] != '*' {
+			continue
+		}
+		numArgs, err := strconv.Atoi(strings.TrimSpace(line[1:]))
+		if err != nil {
+			continue
+		}
+
+		var args []string
+		for i := 0; i < numArgs; i++ {
+
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			totalCommandBytes += len(line)
+
+			length, err := strconv.Atoi(strings.TrimSpace(line[1:]))
+			if err != nil {
+				continue
+			}
+
+			data := make([]byte, length+2)
+			bytesRead, err := io.ReadFull(reader, data)
+			if err != nil {
+				return
+			}
+			totalCommandBytes += bytesRead
+
+			args = append(args, string(data[:length]))
+		}
+
+		if len(args) == 0 {
+			continue
+		}
+
+		command := strings.ToUpper(args[0])
+		cmdArgs := args[1:]
+
+		if command == "REPLCONF" && len(cmdArgs) >= 2 && strings.ToLower(cmdArgs[0]) == "getack" {
+			ackResponse := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%d\r\n", len(strconv.Itoa(replicaOffset)), replicaOffset)
+			conn.Write([]byte(ackResponse))
+		} else {
+
+			executeCommand(nil, command, cmdArgs)
+		}
+
+		replicaOffset += totalCommandBytes
 	}
-	response, err = reader.ReadString('\n')
-	if err != nil {
-		fmt.Println("Failed to read PSYNC response from master:", err)
-		return
+}
+
+type ReplicationState struct {
+	mu       sync.Mutex
+	replicas []net.Conn
+}
+
+func (rs *ReplicationState) AddReplica(conn net.Conn) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.replicas = append(rs.replicas, conn)
+}
+
+func (rs *ReplicationState) Propagate(commandArgs []string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+
+	var commandBuilder strings.Builder
+	commandBuilder.WriteString(fmt.Sprintf("*%d\r\n", len(commandArgs)))
+	for _, arg := range commandArgs {
+		commandBuilder.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg))
 	}
-	fmt.Println("Received response for PSYNC:", strings.TrimSpace(response))
+
+	cmd := []byte(commandBuilder.String())
+
+	for _, replicaConn := range rs.replicas {
+		if replicaConn != nil {
+			replicaConn.Write(cmd)
+		}
+	}
+}
+
+var replicationState = &ReplicationState{}
+
+func (rs *ReplicationState) GetReplicaCount() int {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return len(rs.replicas)
 }
