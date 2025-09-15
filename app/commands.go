@@ -820,7 +820,16 @@ func handleInfo(_ net.Conn, args []string) []byte {
 
 }
 
-func handleReplconf(_ net.Conn, args []string) []byte {
+func handleReplconf(conn net.Conn, args []string) []byte {
+	if len(args) >= 2 && strings.ToLower(args[0]) == "ack" {
+		if conn != nil {
+			if off, err := strconv.Atoi(args[1]); err == nil {
+				replicationState.UpdateAck(conn, off)
+			}
+		}
+		// Do not reply to ACK to avoid polluting the replication stream.
+		return nil
+	}
 	return []byte("+OK\r\n")
 }
 
@@ -845,14 +854,27 @@ func handleWait(_ net.Conn, args []string) []byte {
 	if len(args) != 2 {
 		return []byte("-ERR wrong number of arguments for 'wait' command\r\n")
 	}
-	_, err := strconv.Atoi(args[0])
+	need, err := strconv.Atoi(args[0])
 	if err != nil {
 		return []byte("-ERR value is not an integer or out of range\r\n")
 	}
-	_, err = strconv.Atoi(args[1])
+	ms, err := strconv.Atoi(args[1])
 	if err != nil {
 		return []byte("-ERR value is not an integer or out of range\r\n")
 	}
-	numReplicas := replicationState.GetReplicaCount()
-	return []byte(fmt.Sprintf(":%d\r\n", numReplicas))
+	if need < 0 {
+		need = 0
+	}
+	// Snapshot the current master offset to wait for
+	targetOffset := serverConfig.MasterReplOffset
+	// Ask replicas to ACK their processed offset
+	replicationState.RequestAcks()
+	// Wait (up to timeout) for required acks
+	ackCount := 0
+	if ms > 0 {
+		ackCount = replicationState.WaitForAcks(targetOffset, need, time.Duration(ms)*time.Millisecond)
+	} else { // ms == 0 or negative: no blocking
+		ackCount = replicationState.CountAcks(targetOffset)
+	}
+	return []byte(fmt.Sprintf(":%d\r\n", ackCount))
 }

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type NotificationManager struct {
@@ -112,6 +113,7 @@ func (s *Server) Start() error {
 }
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
+	defer replicationState.RemoveReplica(conn)
 	reader := bufio.NewReader(conn)
 
 	inTransaction := false
@@ -182,7 +184,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 					conn.Write(cmdResponse)
 					if serverConfig.Role == "master" {
 						fullCmdArgs := append([]string{cmd.Command}, cmd.Args...)
-						replicationState.Propagate(fullCmdArgs)
+						serverConfig.MasterReplOffset += replicationState.Propagate(fullCmdArgs)
 					}
 				}
 				inTransaction = false
@@ -206,7 +208,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 				if serverConfig.Role == "master" {
 					switch command {
 					case "SET", "RPUSH", "LPUSH", "LPOP", "INCR", "XADD":
-						replicationState.Propagate(args)
+						serverConfig.MasterReplOffset += replicationState.Propagate(args)
 					}
 				}
 
@@ -374,15 +376,40 @@ func initiateHandshake(masterHost, masterPort string) {
 type ReplicationState struct {
 	mu       sync.Mutex
 	replicas []net.Conn
+	acks     map[net.Conn]int
+	cond     *sync.Cond
+}
+
+func NewReplicationState() *ReplicationState {
+	rs := &ReplicationState{
+		replicas: make([]net.Conn, 0),
+		acks:     make(map[net.Conn]int),
+	}
+	rs.cond = sync.NewCond(&rs.mu)
+	return rs
 }
 
 func (rs *ReplicationState) AddReplica(conn net.Conn) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	rs.replicas = append(rs.replicas, conn)
+	rs.acks[conn] = 0
 }
 
-func (rs *ReplicationState) Propagate(commandArgs []string) {
+func (rs *ReplicationState) RemoveReplica(conn net.Conn) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	for i, c := range rs.replicas {
+		if c == conn {
+			rs.replicas = append(rs.replicas[:i], rs.replicas[i+1:]...)
+			break
+		}
+	}
+	delete(rs.acks, conn)
+	rs.cond.Broadcast()
+}
+
+func (rs *ReplicationState) Propagate(commandArgs []string) int {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 
@@ -391,17 +418,62 @@ func (rs *ReplicationState) Propagate(commandArgs []string) {
 	for _, arg := range commandArgs {
 		commandBuilder.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg))
 	}
-
 	cmd := []byte(commandBuilder.String())
 
 	for _, replicaConn := range rs.replicas {
 		if replicaConn != nil {
-			replicaConn.Write(cmd)
+			_, _ = replicaConn.Write(cmd)
+		}
+	}
+	return len(cmd)
+}
+
+func (rs *ReplicationState) RequestAcks() {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	payload := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
+	b := []byte(payload)
+	for _, c := range rs.replicas {
+		if c != nil {
+			_, _ = c.Write(b)
 		}
 	}
 }
 
-var replicationState = &ReplicationState{}
+func (rs *ReplicationState) UpdateAck(conn net.Conn, offset int) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.acks[conn] = offset
+	rs.cond.Broadcast()
+}
+
+func (rs *ReplicationState) CountAcks(target int) int {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	count := 0
+	for c := range rs.acks {
+		if rs.acks[c] >= target {
+			count++
+		}
+	}
+	return count
+}
+
+func (rs *ReplicationState) WaitForAcks(target, need int, timeout time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	for {
+		cnt := rs.CountAcks(target)
+		if cnt >= need {
+			return cnt
+		}
+		if timeout == 0 || time.Now().After(deadline) {
+			return cnt
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+}
+
+var replicationState = NewReplicationState()
 
 func (rs *ReplicationState) GetReplicaCount() int {
 	rs.mu.Lock()
