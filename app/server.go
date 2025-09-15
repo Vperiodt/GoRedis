@@ -41,8 +41,12 @@ var notificationManager = &NotificationManager{
 	keyChans: make(map[string]chan struct{}),
 }
 var serverConfig struct {
-	Dir        string
-	DbFileName string
+	Port             string
+	Role             string
+	MasterReplID     string
+	MasterReplOffset int
+	Dir              string
+	DbFileName       string
 }
 
 type QueuedCommand struct {
@@ -59,9 +63,29 @@ func NewServer() *Server {
 }
 
 func (s *Server) Start() error {
+	flag.StringVar(&serverConfig.Port, "port", "6379", "The port to listen on")
+
+	var replicaOf string
+	flag.StringVar(&replicaOf, "replicaof", "", "The master server to replicate from, e.g., 'localhost 6379'")
+
 	flag.StringVar(&serverConfig.Dir, "dir", ".", "The directory where RDB files are stored")
 	flag.StringVar(&serverConfig.DbFileName, "dbfilename", "dump.rdb", "The name of the RDB file")
 	flag.Parse()
+
+	if replicaOf != "" {
+		serverConfig.Role = "slave"
+		parts := strings.Split(replicaOf, " ")
+		if len(parts) == 2 {
+			masterHost := parts[0]
+			masterPort := parts[1]
+			go initiateHandshake(masterHost, masterPort)
+		}
+	} else {
+		serverConfig.Role = "master"
+
+		serverConfig.MasterReplID = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
+		serverConfig.MasterReplOffset = 0
+	}
 
 	if err := loadRdbFile(); err != nil && !os.IsNotExist(err) {
 		fmt.Println("Error loading RDB file:", err)
@@ -70,9 +94,10 @@ func (s *Server) Start() error {
 	fmt.Println("Logs from your program will appear here!")
 
 	var err error
-	s.listener, err = net.Listen("tcp", "0.0.0.0:6379")
+	listenAddr := fmt.Sprintf("0.0.0.0:%s", serverConfig.Port)
+	s.listener, err = net.Listen("tcp", listenAddr)
 	if err != nil {
-		return fmt.Errorf("failed to bind to port 6379: %w", err)
+		return fmt.Errorf("failed to bind to port %s: %w", serverConfig.Port, err)
 	}
 	defer s.listener.Close()
 
@@ -183,4 +208,122 @@ func (s *Server) handleConnection(conn net.Conn) {
 			conn.Write(response)
 		}
 	}
+}
+
+type ListWaiter struct {
+	key    string
+	signal chan struct{}
+}
+type BlockingListManager struct {
+	mu      sync.Mutex
+	waiters map[string][]*ListWaiter
+}
+
+func (blm *BlockingListManager) GetWaiter(key string) *ListWaiter {
+	blm.mu.Lock()
+	defer blm.mu.Unlock()
+
+	waiter := &ListWaiter{
+		key:    key,
+		signal: make(chan struct{}, 1),
+	}
+	blm.waiters[key] = append(blm.waiters[key], waiter)
+	return waiter
+}
+
+func (blm *BlockingListManager) RemoveWaiter(waiter *ListWaiter) {
+	blm.mu.Lock()
+	defer blm.mu.Unlock()
+
+	queue, ok := blm.waiters[waiter.key]
+	if !ok {
+		return
+	}
+	newQueue := make([]*ListWaiter, 0)
+	for _, w := range queue {
+		if w != waiter {
+			newQueue = append(newQueue, w)
+		}
+	}
+	blm.waiters[waiter.key] = newQueue
+}
+
+func (blm *BlockingListManager) Notify(key string) {
+	blm.mu.Lock()
+	defer blm.mu.Unlock()
+
+	queue, ok := blm.waiters[key]
+	if !ok || len(queue) == 0 {
+		return
+	}
+
+	waiter := queue[0]
+	blm.waiters[key] = queue[1:]
+	waiter.signal <- struct{}{}
+}
+
+var blockingListManager = &BlockingListManager{
+	waiters: make(map[string][]*ListWaiter),
+}
+
+func initiateHandshake(masterHost, masterPort string) {
+	masterAddr := fmt.Sprintf("%s:%s", masterHost, masterPort)
+	conn, err := net.Dial("tcp", masterAddr)
+	if err != nil {
+		fmt.Println("Failed to connect to master:", err)
+		os.Exit(1)
+	}
+
+	reader := bufio.NewReader(conn)
+
+	pingCmd := "*1\r\n$4\r\nPING\r\n"
+	_, err = conn.Write([]byte(pingCmd))
+	if err != nil {
+		fmt.Println("Failed to send PING to master:", err)
+		return
+	}
+	response, err := reader.ReadString('\n')
+	if err != nil || strings.TrimSpace(response) != "+PONG" {
+		fmt.Println("Invalid response to PING from master:", response)
+		return
+	}
+	fmt.Println("Received PONG from master")
+
+	replconfPortCmd := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$%d\r\n%s\r\n", len(serverConfig.Port), serverConfig.Port)
+	_, err = conn.Write([]byte(replconfPortCmd))
+	if err != nil {
+		fmt.Println("Failed to send REPLCONF port to master:", err)
+		return
+	}
+	response, err = reader.ReadString('\n')
+	if err != nil || strings.TrimSpace(response) != "+OK" {
+		fmt.Println("Invalid response to REPLCONF port from master:", response)
+		return
+	}
+	fmt.Println("Received OK for REPLCONF listening-port")
+
+	replconfCapaCmd := "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
+	_, err = conn.Write([]byte(replconfCapaCmd))
+	if err != nil {
+		fmt.Println("Failed to send REPLCONF capa to master:", err)
+		return
+	}
+	response, err = reader.ReadString('\n')
+	if err != nil || strings.TrimSpace(response) != "+OK" {
+		fmt.Println("Invalid response to REPLCONF capa from master:", response)
+		return
+	}
+	fmt.Println("Received OK for REPLCONF capa")
+	psyncCmd := "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
+	_, err = conn.Write([]byte(psyncCmd))
+	if err != nil {
+		fmt.Println("Failed to send PSYNC to master:", err)
+		return
+	}
+	response, err = reader.ReadString('\n')
+	if err != nil {
+		fmt.Println("Failed to read PSYNC response from master:", err)
+		return
+	}
+	fmt.Println("Received response for PSYNC:", strings.TrimSpace(response))
 }

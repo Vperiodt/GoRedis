@@ -29,6 +29,14 @@ func executeCommand(command string, args []string) []byte {
 		return handleXrange(args)
 	case "LRANGE":
 		return handleLrange(args)
+	case "LPUSH":
+		return handleLpush(args)
+	case "LLEN":
+		return handleLlen(args)
+	case "LPOP":
+		return handleLpop(args)
+	case "BLPOP":
+		return handleBlpop(args)
 	case "XREAD":
 		return handleXread(args)
 	case "CONFIG":
@@ -37,6 +45,12 @@ func executeCommand(command string, args []string) []byte {
 		return handleKeys(args)
 	case "RPUSH":
 		return handleRpush(args)
+	case "INFO":
+		return handleInfo(args)
+	case "REPLCONF":
+		return handleReplconf(args)
+	case "PSYNC":
+		return handlePsync(args)
 	default:
 		return []byte(fmt.Sprintf("-ERR unknown command '%s'\r\n", command))
 	}
@@ -538,7 +552,6 @@ func handleRpush(args []string) []byte {
 
 	var list RedisList
 	entry, ok := dataStore.data[key]
-
 	if ok {
 		existingList, isList := entry.value.(RedisList)
 		if !isList {
@@ -550,8 +563,12 @@ func handleRpush(args []string) []byte {
 	}
 
 	list = append(list, elements...)
-
 	dataStore.data[key] = valueEntry{value: list}
+
+	// After a successful push, notify any waiting BLPOP clients.
+	if len(elements) > 0 {
+		blockingListManager.Notify(key)
+	}
 
 	return []byte(fmt.Sprintf(":%d\r\n", len(list)))
 }
@@ -615,4 +632,190 @@ func handleLrange(args []string) []byte {
 	}
 
 	return []byte(builder.String())
+}
+func handleLpush(args []string) []byte {
+	if len(args) < 2 {
+		return []byte("-ERR wrong number of arguments for 'lpush' command\r\n")
+	}
+	key := args[0]
+	elements := args[1:]
+
+	dataStore.Lock()
+	defer dataStore.Unlock()
+
+	var list RedisList
+	entry, ok := dataStore.data[key]
+	if ok {
+		existingList, isList := entry.value.(RedisList)
+		if !isList {
+			return []byte("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+		}
+		list = existingList
+	} else {
+		list = make(RedisList, 0)
+	}
+
+	for _, el := range elements {
+		list = append(RedisList{el}, list...)
+	}
+
+	dataStore.data[key] = valueEntry{value: list}
+
+	if len(elements) > 0 {
+		blockingListManager.Notify(key)
+	}
+
+	return []byte(fmt.Sprintf(":%d\r\n", len(list)))
+}
+func handleLlen(args []string) []byte {
+	if len(args) != 1 {
+		return []byte("-ERR wrong number of arguments for 'llen' command\r\n")
+	}
+	key := args[0]
+
+	dataStore.RLock()
+	defer dataStore.RUnlock()
+
+	entry, ok := dataStore.data[key]
+	if !ok {
+		return []byte(":0\r\n")
+	}
+
+	list, isList := entry.value.(RedisList)
+	if !isList {
+		return []byte("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	}
+
+	return []byte(fmt.Sprintf(":%d\r\n", len(list)))
+}
+
+func handleLpop(args []string) []byte {
+	if len(args) < 1 || len(args) > 2 {
+		return []byte("-ERR wrong number of arguments for 'lpop' command\r\n")
+	}
+	key := args[0]
+	count := 1
+	if len(args) == 2 {
+		var err error
+		count, err = strconv.Atoi(args[1])
+		if err != nil {
+			return []byte("-ERR value is not an integer or out of range\r\n")
+		}
+	}
+
+	dataStore.Lock()
+	defer dataStore.Unlock()
+
+	entry, ok := dataStore.data[key]
+	if !ok {
+		return []byte("$-1\r\n")
+	}
+	list, isList := entry.value.(RedisList)
+	if !isList {
+		return []byte("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+	}
+	if len(list) == 0 {
+		return []byte("$-1\r\n")
+	}
+
+	if count > len(list) {
+		count = len(list)
+	}
+
+	elementsToPop := list[:count]
+	newList := list[count:]
+	dataStore.data[key] = valueEntry{value: newList}
+
+	if len(args) == 1 {
+		element := elementsToPop[0]
+		return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(element), element))
+	}
+
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("*%d\r\n", len(elementsToPop)))
+	for _, item := range elementsToPop {
+		builder.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(item), item))
+	}
+	return []byte(builder.String())
+}
+func handleBlpop(args []string) []byte {
+	if len(args) < 2 {
+		return []byte("-ERR wrong number of arguments for 'blpop' command\r\n")
+	}
+	key := args[0]
+	timeoutStr := args[1]
+
+	timeout, err := strconv.ParseFloat(timeoutStr, 64)
+	if err != nil {
+		return []byte("-ERR value is not an integer or out of range\r\n")
+	}
+
+	for {
+		dataStore.Lock()
+		entry, ok := dataStore.data[key]
+		if ok {
+			list, isList := entry.value.(RedisList)
+			if isList && len(list) > 0 {
+				element := list[0]
+				dataStore.data[key] = valueEntry{value: list[1:]}
+				dataStore.Unlock()
+				return []byte(fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(key), key, len(element), element))
+			}
+		}
+		dataStore.Unlock()
+
+		waiter := blockingListManager.GetWaiter(key)
+
+		var timeoutChan <-chan time.Time
+		if timeout > 0 {
+			timeoutChan = time.After(time.Duration(timeout * float64(time.Second)))
+		}
+
+		select {
+		case <-waiter.signal:
+			continue
+		case <-timeoutChan:
+			blockingListManager.RemoveWaiter(waiter)
+			return []byte("*-1\r\n") // Null array
+		}
+	}
+}
+
+func handleInfo(args []string) []byte {
+	if len(args) < 1 {
+		return []byte("-ERR wrong number of arguments for 'info' command\r\n")
+	}
+
+	section := strings.ToLower(args[0])
+
+	if section == "replication" {
+		var infoLines []string
+		infoLines = append(infoLines, fmt.Sprintf("role:%s", serverConfig.Role))
+
+		if serverConfig.Role == "master" {
+			infoLines = append(infoLines, fmt.Sprintf("master_replid:%s", serverConfig.MasterReplID))
+			infoLines = append(infoLines, fmt.Sprintf("master_repl_offset:%d", serverConfig.MasterReplOffset))
+		}
+
+		infoStr := strings.Join(infoLines, "\r\n")
+
+		return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(infoStr), infoStr))
+	}
+
+	return []byte("$0\r\n\r\n")
+
+}
+
+func handleReplconf(args []string) []byte {
+	return []byte("+OK\r\n")
+}
+
+func handlePsync(args []string) []byte {
+
+	if len(args) != 2 {
+		return []byte("-ERR wrong number of arguments for 'psync' command\r\n")
+	}
+	response := fmt.Sprintf("+FULLRESYNC %s %d\r\n", serverConfig.MasterReplID, serverConfig.MasterReplOffset)
+
+	return []byte(response)
 }
