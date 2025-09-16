@@ -16,6 +16,7 @@ Supports a wide array of commands and features, grouped by functionality:
 
 ### Prerequisites
 - Go (version 1.18 or newer recommended).
+- `redis-cli` (for interacting with the server).
 
 ### Building the Server
 1. Clone the repository.
